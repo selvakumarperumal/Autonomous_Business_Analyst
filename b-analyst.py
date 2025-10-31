@@ -176,14 +176,6 @@ class RequirementsDefinition(BaseModel):
     non_functional_requirements: list[str] = Field(..., description="Non-functional requirements for the project")
     priorities: list[str] = Field(..., description="Prioritized list of requirements for the project")
 
-class DataInsights(BaseModel):
-    """
-    Key findings and insights derived from the data analysis phase.
-    """
-
-    insights: list[str] = Field(..., description="Key insights derived from the data analysis")
-    recommendations: list[str] = Field(..., description="Recommendations based on the data insights")
-
 class GapAnalysis(BaseModel):
     """
     Documented gaps and resolutions identified during the analysis phase.
@@ -199,7 +191,6 @@ class ActionableRecommendations(BaseModel):
 
     recommendations: list[str] = Field(..., description="Actionable recommendations for the business")
     implementation_plan: str = Field(..., description="Detailed plan for implementing the recommendations")
-    expected_outcomes: list[str] = Field(..., description="Expected outcomes from implementing the recommendations")
 
 class BusinessAnalysis(BaseModel):
     analysis: str
@@ -211,13 +202,35 @@ class BusinessContextState(BaseModel):
     project_brief: ProjectBrief = None
     business_understanding: BusinessUnderstanding = None
     requirements_definition: RequirementsDefinition = None
-    data_insights: DataInsights = None
+    analysis: BusinessAnalysis = None
     gap_analysis: GapAnalysis = None
     actionable_recommendations: ActionableRecommendations = None
 
 class DataDependency(BaseModel):
     dataframes: Any
     dataset_metadata: str
+
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
+
+class KeyFindings(BaseModel):
+    """Overall interpreted insights from the analysis."""
+    summary: str = Field(..., description="Concise overview of major findings")
+    drivers: List[str] = Field(..., description="Key influencing factors or variables driving patterns")
+    opportunities: Optional[List[str]] = Field(None, description="Potential improvements, optimizations, or actions suggested")
+
+class BusinessRecommendation(BaseModel):
+    """Actionable recommendations derived from analysis."""
+    recommendation: str = Field(..., description="Action or strategy suggested")
+    reasoning: Optional[str] = Field(None, description="Explanation of why this recommendation is relevant")
+    potential_impact: Optional[str] = Field(None, description="Expected benefit or business outcome")
+
+class BusinessAnalysisResult(BaseModel):
+    """Final structured output from the Business Analyst Agent."""
+    key_findings: KeyFindings = Field(..., description="Synthesized insights from overall analysis")
+    business_recommendations: List[BusinessRecommendation] = Field(..., description="Final actionable recommendations")
+    summary_report: Optional[str] = Field(None, description="Concise summary report of the analysis and recommendations")
+
 
 business_context_agent = ThinkingAgent(
     config=HFModelSettings(),
@@ -463,18 +476,6 @@ gap_analysis_agent = ThinkingAgent(
     output_type=GapAnalysis,
 )
 
-data_insights_agent = ThinkingAgent(
-    config=HFModelSettings(),
-    output_type=DataInsights,
-)
-
-@data_insights_agent.system_prompt
-def data_insights_system_prompt() -> str:
-    return (
-        "You are an expert business analyst. "
-        "Based on the given project brief and data analysis results, summarize the key findings, insights, and any data quality issues identified."
-    )
-
 @gap_analysis_agent.system_prompt
 def gap_analysis_system_prompt() -> str:
     return (
@@ -484,14 +485,21 @@ def gap_analysis_system_prompt() -> str:
 
 actionable_recommendations_agent = ThinkingAgent(
     config=HFModelSettings(),
-    output_type=ActionableRecommendations,
+    output_type=BusinessAnalysisResult,
 )
 
 @actionable_recommendations_agent.system_prompt
 def actionable_recommendations_system_prompt() -> str:
     return (
-        "You are an expert business analyst. "
-        "Based on the given project brief and data insights, provide practical recommendations and a detailed implementation plan, along with the expected outcomes."
+        """
+        You are an expert business analyst.
+        Based on the given project brief, business understanding, requirements definition, and gap analysis, and Business Analysis, provide practical recommendations and an action plan for the business.
+        Your recommendations should include:
+        1. Clear and actionable recommendations that address the identified gaps and align with the business goals.
+        2. A detailed implementation plan outlining the steps required to execute the recommendations.
+
+        Explain the reasoning behind each recommendation and its potential impact on the business. Elaborate where necessary.
+        """
     )
 
 def reduce_to_str(current: str, new: str) -> str:
@@ -502,7 +510,7 @@ async def run_business_analysis_pipeline(description: str):
         state_type=BusinessContextState,
         input_type=RawBusinessDescription,
         deps_type=DataDependency,
-        output_type=list[Any],
+        output_type=list[BaseModel],
     )
 
     collect_all_outputs = graph.join(reducer=reduce_list_extend, initial_factory=list, node_id="collect_all_outputs",)
@@ -561,6 +569,10 @@ async def run_business_analysis_pipeline(description: str):
         ctx: StepContext[BusinessContextState, DataDependency, tuple[ProjectBrief, BusinessUnderstanding, RequirementsDefinition]]
     ) -> list[str]:
         project_brief, business_understanding, requirements_definition = ctx.inputs
+
+        ctx.state.project_brief = project_brief
+        ctx.state.business_understanding = business_understanding
+        ctx.state.requirements_definition = requirements_definition
 
         df_paths = project_brief.datasets
 
@@ -702,9 +714,78 @@ async def run_business_analysis_pipeline(description: str):
         return result
     
     @graph.step
-    async def analyzed_data_to_obj(ctx: StepContext[BusinessContextState, DataDependency, str]) -> list[BaseModel]:
-        analysis_str = ctx.inputs
-        return [BusinessAnalysis(analysis=analysis_str)]
+    async def analyzed_data_to_obj(ctx: StepContext[BusinessContextState, DataDependency, str]) -> None:
+        ctx.state.analysis = BusinessAnalysis(analysis=ctx.inputs)
+        return None
+    
+    @graph.step
+    async def analyze_gaps(
+        ctx: StepContext[BusinessContextState, DataDependency, list[BaseModel]]
+    ) -> None:
+        project_brief = ctx.state.project_brief
+
+        user_prompt = f"""
+        Here is the project brief:
+        {project_brief.model_dump()}
+
+        Here is the data insights:
+        {ctx.state.analysis.model_dump()}
+
+        here is the business understanding:
+        {ctx.state.business_understanding.model_dump()}
+
+        Here is the requirements definition:
+        {ctx.state.requirements_definition.model_dump()}
+
+        Based on this information, identify any gaps in the analysis or data, along with their root causes.
+        """
+        result = await gap_analysis_agent.run(user_prompt)
+
+        ctx.state.gap_analysis = result.output
+
+        return None
+    
+    @graph.step
+    async def provide_actionable_recommendations(
+        ctx: StepContext[BusinessContextState, DataDependency, None]
+    ) -> list[Any]:
+        project_brief = ctx.state.project_brief
+        business_understanding = ctx.state.business_understanding
+        requirements_definition = ctx.state.requirements_definition
+        gap_analysis = ctx.state.gap_analysis
+        analysis = ctx.state.analysis
+
+        user_prompt = f"""
+        Here is the project brief:
+        {project_brief.model_dump()}
+
+        Here is the business understanding:
+        {business_understanding.model_dump()}
+
+        Here is the requirements definition:
+        {requirements_definition.model_dump()}
+
+        Here is the gap analysis:
+        {gap_analysis.model_dump()}
+
+        Here is the business analysis:
+        {analysis.model_dump()}
+
+        Based on this information, provide practical recommendations and an action plan for the business.
+        """
+        result = await actionable_recommendations_agent.run(user_prompt)
+
+        ctx.state.actionable_recommendations = result.output
+
+        return [
+            project_brief,
+            business_understanding,
+            requirements_definition,
+            analysis,
+            gap_analysis,
+            result.output,
+        ]
+
     
 
     graph.add(
@@ -717,7 +798,7 @@ async def run_business_analysis_pipeline(description: str):
         graph.edge_from(analyze_business_understanding).to(define_requirements),
     )
     graph.add(
-        graph.edge_from(define_requirements).to(generate_analytical_queries, collect_all_outputs),
+        graph.edge_from(define_requirements).to(generate_analytical_queries),
     )
     graph.add(
         graph.edge_from(generate_analytical_queries).map().to(analyze_data),
@@ -729,10 +810,13 @@ async def run_business_analysis_pipeline(description: str):
         graph.edge_from(collect_query_outputs).to(analyzed_data_to_obj),
     )
     graph.add(
-        graph.edge_from(analyzed_data_to_obj).to(collect_all_outputs),
+        graph.edge_from(analyzed_data_to_obj).to(analyze_gaps),
     )
     graph.add(
-        graph.edge_from(collect_all_outputs).to(graph.end_node),
+        graph.edge_from(analyze_gaps).to(provide_actionable_recommendations),
+    )
+    graph.add(
+        graph.edge_from(provide_actionable_recommendations).to(graph.end_node),
     )
 
     graph_instance = graph.build()
@@ -830,6 +914,6 @@ if __name__ == "__main__":
     import asyncio
 
     result = asyncio.run(run_business_analysis_pipeline(sample_description))
-    print(result)
+    print(result[5])
 
 
